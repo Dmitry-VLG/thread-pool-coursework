@@ -21,9 +21,20 @@ public class NamedThreadFactory implements ThreadFactory {
 
     @Override
     public Thread newThread(Runnable r) {
-        Thread thread = new Thread(r, prefix + counter.getAndIncrement());
+        String threadName = prefix + counter.getAndIncrement();
+
+        Runnable wrapped = () -> {
+            try {
+                r.run();
+            } finally {
+                log.info("Thread {} terminated", threadName);
+            }
+        };
+
+        Thread thread = new Thread(wrapped, threadName);
         thread.setDaemon(daemon);
-        log.info("Created thread {}", thread.getName());
+
+        log.info("Created thread {}", threadName);
         return thread;
     }
 }

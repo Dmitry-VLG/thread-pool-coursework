@@ -91,7 +91,8 @@ public class Main {
 
         Thread.sleep(1000);
 
-        List<Runnable> cancelled = secondPool.shutdownNow();
+        secondPool.shutdownNow();
+        List<Runnable> cancelled = secondPool.getLastCancelledTasks();
         log.info("shutdownNow returned {} not executed tasks", cancelled.size());
 
         secondPool.awaitTermination(30, TimeUnit.SECONDS);

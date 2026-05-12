@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -34,6 +35,7 @@ public class CustomThreadPool implements CustomExecutor {
 
     private final List<BlockingQueue<Runnable>> queues;
     private final Set<Worker> workers = ConcurrentHashMap.newKeySet();
+    private final List<Runnable> lastCancelledTasks = Collections.synchronizedList(new ArrayList<>());
 
     private final AtomicInteger roundRobinIndex = new AtomicInteger(0);
     private final AtomicInteger idleWorkers = new AtomicInteger(0);
@@ -74,8 +76,8 @@ public class CustomThreadPool implements CustomExecutor {
         this.queueSize = queueSize;
         this.queueCount = queueCount;
         this.minSpareThreads = minSpareThreads;
-        this.rejectionPolicy = Objects.requireNonNull(rejectionPolicy);
-        this.threadFactory = Objects.requireNonNull(threadFactory);
+        this.rejectionPolicy = Objects.requireNonNull(rejectionPolicy, "rejectionPolicy must not be null");
+        this.threadFactory = Objects.requireNonNull(threadFactory, "threadFactory must not be null");
 
         this.queues = new ArrayList<>(queueCount);
         for (int i = 0; i < queueCount; i++) {
@@ -113,7 +115,7 @@ public class CustomThreadPool implements CustomExecutor {
     }
 
     private void ensureSpareWorkers() {
-        if (!shutdown && idleWorkers.get() <= minSpareThreads) {
+        if (!shutdown && idleWorkers.get() < minSpareThreads) {
             addWorker(nextQueueIndex(), false);
         }
     }
@@ -171,9 +173,7 @@ public class CustomThreadPool implements CustomExecutor {
             int anotherQueue = (homeQueueIndex + i) % queueCount;
             Runnable task = queues.get(anotherQueue).poll();
             if (task != null) {
-                log.debug("{} stole task from queue {}",
-                        Thread.currentThread().getName(),
-                        anotherQueue);
+                log.debug("{} stole task from queue {}", Thread.currentThread().getName(), anotherQueue);
                 return task;
             }
         }
@@ -253,7 +253,6 @@ public class CustomThreadPool implements CustomExecutor {
         return futureTask;
     }
 
-    @Override
     public Future<?> submit(Runnable task) {
         Objects.requireNonNull(task, "task must not be null");
         FutureTask<?> futureTask = new FutureTask<>(task, null);
@@ -280,29 +279,32 @@ public class CustomThreadPool implements CustomExecutor {
     }
 
     @Override
-    public List<Runnable> shutdownNow() {
+    public void shutdownNow() {
         mainLock.lock();
         try {
             shutdown = true;
             stop = true;
             log.warn("ShutdownNow requested");
+
+            lastCancelledTasks.clear();
+            for (BlockingQueue<Runnable> queue : queues) {
+                queue.drainTo(lastCancelledTasks);
+            }
         } finally {
             mainLock.unlock();
-        }
-
-        List<Runnable> notExecutedTasks = new ArrayList<>();
-        for (BlockingQueue<Runnable> queue : queues) {
-            queue.drainTo(notExecutedTasks);
         }
 
         for (Worker worker : workers) {
             worker.interruptIfNeeded();
         }
-
-        return notExecutedTasks;
     }
 
-    @Override
+    public List<Runnable> getLastCancelledTasks() {
+        synchronized (lastCancelledTasks) {
+            return new ArrayList<>(lastCancelledTasks);
+        }
+    }
+
     public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
         long deadline = System.nanoTime() + unit.toNanos(timeout);
 
@@ -316,12 +318,10 @@ public class CustomThreadPool implements CustomExecutor {
         return isTerminated();
     }
 
-    @Override
     public boolean isShutdown() {
         return shutdown;
     }
 
-    @Override
     public boolean isTerminated() {
         return shutdown && workers.isEmpty() && allQueuesEmpty();
     }
@@ -382,7 +382,8 @@ public class CustomThreadPool implements CustomExecutor {
                         if (stop || (shutdown && allQueuesEmpty())) {
                             break;
                         }
-                        log.debug("Worker {} interrupted but continues waiting", Thread.currentThread().getName());
+                        log.debug("Worker {} interrupted but continues waiting",
+                                Thread.currentThread().getName());
                         continue;
                     }
 
@@ -390,6 +391,14 @@ public class CustomThreadPool implements CustomExecutor {
                         break;
                     }
 
+                    if (stop) {
+                        log.debug("Worker {} will not start a new task because pool is in STOP state",
+                                Thread.currentThread().getName());
+                        break;
+                    }
+
+                    // shutdown() запрещает только прием новых задач.
+                    // Уже принятые задачи пул должен корректно доработать.
                     try {
                         log.debug("Worker {} executes task", Thread.currentThread().getName());
                         task.run();
